@@ -1,0 +1,303 @@
+# -*- coding: utf-8 -*-
+
+from select import select
+
+import sqlite3 as SQL
+import socket
+import time
+import sys
+import os
+import os.path
+
+class Server:
+
+	def __init__(self, host='localhost', port=10024):
+
+		# === Variables ===
+		self.host = host
+		self.port = port
+
+		self.tasks = []
+		self.to_read = {}
+		self.to_write = {}
+
+		# === Create socket ===
+		self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self.server_socket.bind((self.host, self.port))
+		self.server_socket.listen()
+
+		self.req = Requests(self.server_socket)
+
+		self.tasks.append(self.start())
+		self.event_loop()
+
+
+	def start(self):
+
+		print('Server starting...')
+
+		while True:
+
+			yield ('read', self.server_socket)
+
+			client_socket, addr = self.server_socket.accept()
+			self.tasks.append(self.client(client_socket))
+
+
+	def client(self, client_socket):
+
+		while True:
+
+			yield ('read', client_socket)
+
+			try:
+				request = client_socket.recv(4096)
+
+			except (ConnectionResetError, ConnectionAbortedError):
+				continue
+
+			if not request:
+				break
+
+			else:
+				request = eval(request.decode())
+				print('self.req.%s%s' % (request[0], request[1]))
+				response = str(eval('self.req.%s%s' % (
+					request[0],
+					request[1]))
+				).encode()
+
+				yield ('write', client_socket)
+				client_socket.send(response)	# Rewrite
+
+			print('\n')
+
+		client_socket.close()
+
+
+	def event_loop(self):
+
+		while any([self.tasks, self.to_read, self.to_write]):
+
+			while not self.tasks:
+
+				ready_to_read, ready_to_write, _ = select(
+					self.to_read,
+					self.to_write,
+					[]
+				)
+
+				for sock in ready_to_read:
+					self.tasks.append(self.to_read.pop(sock))
+
+				for sock in ready_to_write:
+					self.tasks.append(self.to_write.pop(sock))
+
+			try:
+				task = self.tasks.pop(0)
+				reason, sock = next(task)
+
+				if reason == 'read':
+					self.to_read[sock] = task
+
+				if reason == 'write':
+					self.to_write[sock] = task
+
+			except StopIteration:
+				pass
+
+
+class DataBase:
+
+	def __init__(self, path='db\\Users'):
+
+		self.path = path
+
+		self.conn = SQL.connect('%s\\%s.db' % (
+			os.path.dirname(__file__),
+			self.path)
+		)
+		self.cursor = self.conn.cursor()
+
+
+	def newCreate(self, name, titles=()):
+
+		name = os.path.basename(name).split('.')[0]
+		self.cursor.execute("pragma table_info (%s)" % name)
+		len_cols = len(self.cursor.fetchall())
+
+		if len_cols == None:
+			len_cols = len(titles)
+
+		self.cursor.execute(
+			"""
+			CREATE TABLE IF NOT EXISTS %(name)s
+			%(titles)s,
+			PRIMARY KEY(%(id)s))
+			""" % {
+				'name' : name,
+				'titles' : str(tuple(titles))[:-1].replace("'", ''),
+				'id' : str(titles[0]).split(' ')[0]
+			}
+		)
+
+		self.conn.commit()
+
+
+	def select(self, request):
+
+		self.cursor.execute(request)
+
+		data = self.cursor.fetchall()
+
+		self.conn.commit()
+
+		return data
+
+
+	def write(self, request):
+
+		self.cursor.execute(request)
+
+		self.conn.commit()
+
+
+	def last_num_row(self):
+
+		# == PATTERN ==
+		# +-----------+
+		# |   Count   |
+		# +-----------+
+		# |     n     |
+		# +-----------+
+
+		row_nums = self.select(request="""
+			SELECT COUNT(*) FROM %s
+			""" % (self.path.split('\\')[1])
+		)
+
+		return row_nums[0][0]
+
+
+class Requests(DataBase):
+
+	def __init__(self, sock):
+
+		self.sock = sock
+		self.UserDBPath = 'db\\Users'
+		self.GeolocationDBPath = 'db\\Geolocation'
+
+		self.DBUser = DataBase(path=self.UserDBPath)
+		self.DBGeolocation = DataBase(path=self.GeolocationDBPath)
+
+		self.DBUser.newCreate(
+			name = '%s.db' % os.path.join(
+				os.path.dirname(__file__),
+				self.UserDBPath
+			),
+			titles = (
+				'Id int',
+				'Name varchar(100)',
+				'Email varchar(50)',
+				'Password varchar(100)',
+				'Car varchar(50)',
+				'Currest_Route varchar(100)',
+				'Status int',
+				'Enter_Time float'
+			)
+		)
+
+		self.DBGeolocation.newCreate(
+			name = '%s.db' % os.path.join(
+				os.path.dirname(__file__),
+				self.GeolocationDBPath
+			),
+			titles = (
+				'Id int',
+				'Name varchar(100)',
+				'Route varchar(100)',
+				'Status int',
+				'StartPoint varchar(50)',
+				'EndPoint varchar(50)',
+				'Geolocation varchar(50)'
+			)
+		)
+
+
+	def check_log_in(self, login, password):
+
+		result = self.DBUser.select(request="""
+			SELECT Name, Email, Password FROM %(name)s
+			WHERE Email = '%(login)s'
+			""" % {
+				'name' : self.UserDBPath.split('\\')[1],
+				'login' : login
+			}
+		)
+
+		return result
+
+
+	def sign_up(self, *args):
+
+		temp_list = [a for a in args]
+		temp_list.extend(['Неизестно', 'Online', int(time.time()*1000)])
+		temp_list.insert(0, self.DBUser.last_num_row())
+
+		result = self.DBUser.write(request="""
+			INSERT INTO %(name)s
+			VALUES %(vals)s
+			""" % {
+				'name' : self.UserDBPath.split('\\')[1],
+				'vals' : tuple(temp_list)
+			}
+		)
+
+
+	def send_mail(self, from_, to, text):	# Does not work!	Do not touch
+
+		print('[%s]: %s' % (to, text))
+		# print('New message from %s!' % (from_))
+
+
+	def create_new_route(self, driver, route_name, from_, to):
+
+		temp_list = [
+			self.DBGeolocation.last_num_row(),
+			driver,
+			route_name,
+			0,
+			str(from_),
+			str(to),
+			str([])
+		]
+
+		self.DBGeolocation.write(request="""
+			INSERT INTO %(name)s
+			VALUES %(vals)s
+			""" % {
+				'name' : self.GeolocationDBPath.split('\\')[1],
+				'vals' : tuple(temp_list)
+			}
+		)
+
+
+	def new_geolocation(self, user, route, lat, lng):
+
+		geo_info = self.DBGeolocation.select(request="""
+			SELECT Geolocation FROM Geolocation
+			WHERE Name = \'%(user)s\' AND Route = \'%(route)s\'
+			""" % {
+				'user' : user,
+				'route' : route
+			}
+		)
+
+		if geo_info == []:	return False
+		elif geo_info[3] == 1:	return False
+
+		return True
+
+
+if __name__ == '__main__':
+	serv = Server()
